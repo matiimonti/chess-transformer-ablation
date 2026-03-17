@@ -49,6 +49,10 @@ def scaled_dot_product_attention(
 
     return torch.matmul(attn_weights, v)
 
-
+## Casual mask
+# Verify by hand that position 0 can only attend to position 0, position 1 to positions 0-1, etc
+def causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    """Upper-triangular mask — prevents position i from attending to j > i."""
+    return torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
 
 
