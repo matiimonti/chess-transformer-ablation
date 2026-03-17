@@ -11,6 +11,7 @@ Pipeline:
 import os
 import re
 import json
+from pathlib import Path
 from typing import List, Tuple, Optional
 
 import torch
@@ -188,5 +189,28 @@ class ChessDataset(Dataset):
 
 
 
+### Full pipeline
+def load_data(pgn_path: str, seq_len: int = 128, max_games=None, max_bytes=None):
+    with open(pgn_path, 'r', encoding='utf-8', errors='ignore') as f:
+        text = f.read(max_bytes) if max_bytes else f.read()
 
+    # Trim to last complete game
+    last_newline = text.rfind('\n\n')
+    if last_newline != -1:
+        text = text[:last_newline]
 
+    print("Parsing PGN...")
+    games = parse_pgn(text)
+    print(f"Parsed {len(games)} games")
+
+    if max_games:
+        games = games[:max_games]
+
+    tokenizer = ChessTokenizer()
+    tokenizer.build_from_games(games)
+
+    encoded = [tokenizer.encode(g) for g in games]
+    dataset = ChessDataset(encoded, seq_len=seq_len, pad_id=tokenizer.pad_id)
+    print(f"Total samples: {len(dataset)}")
+
+    return dataset, tokenizer
