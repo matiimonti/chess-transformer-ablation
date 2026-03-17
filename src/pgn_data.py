@@ -10,7 +10,18 @@ Pipeline:
 
 import os
 import re
-from typing import List
+import json
+from typing import List, Tuple, Optional
+
+### Special Tokens
+PAD_TOKEN = "<PAD>"
+BOS_TOKEN = "<BOS>"   # beginning of game
+EOS_TOKEN = "<EOS>"   # end of game
+UNK_TOKEN = "<UNK>"
+
+SPECIAL_TOKENS = [PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN]
+
+
 
 ## Parsing PGN - based after first look at original dataset
 def parse_pgn(pgn_text: str) -> List[List[str]]:
@@ -55,4 +66,87 @@ def parse_pgn(pgn_text: str) -> List[List[str]]:
             games.append(moves)
 
     return games
+
+## Tokenizer 
+
+class ChessTokenizer: 
+    """
+    Simple vocabulary-based tokenizer for chess moves.
+
+    Moves are already discrete tokens (e.g. "e4", "Nf3", "O-O"),
+    so we just need a string -> int mapping.
+    Vocabulary size is typically ~2000 for standard chess.
+    """
+
+    def __init__(self):
+        self.token2id = {}
+        self.id2token = {}
+        self._add_special_tokens()
+
+    def _add_special_tokens(self):
+        for token in SPECIAL_TOKENS:
+            self._add_token(token)
+
+    def _add_token(self, token:str) -> int:
+        if token not in self.token2id:
+            idx = len(self.token2id)
+            self.token2id[token] = idx
+            self.id2token[idx] = token
+        return self.token2id[token]
+    
+    def build_from_games(self, games: List[list[str]]):
+        """Build the vocabulary from a list of tokenized games"""
+        for game in games:
+            for move in game:
+                self._add_token(move)
+        print(f"Vocabulary size: {len(self.token2id)} tokens")
+
+    def encode(self, moves: List[str], add_special: bool = True) -> List[int]:
+        """Convert moves list to integer ids."""
+        ids = [self.token2id.get(m, self.token2id[UNK_TOKEN]) for m in moves]
+        if add_special:
+            ids = [self.token2id[BOS_TOKEN]] + ids + [self.token2id[EOS_TOKEN]]
+        return ids
+
+    def decode(self, ids: List[int]) -> List[str]:
+        """Convert integer ids to moves."""
+        return [self.id2token.get(i, UNK_TOKEN) for i in ids]
+
+    @property  
+    def vocab_size(self) -> int:
+        return len(self.token2id)
+
+    @property
+    def pad_id(self) -> int:
+        return self.token2id[PAD_TOKEN]
+
+    @property
+    def bos_id(self) -> int:
+        return self.token2id[BOS_TOKEN]
+    
+    @property
+    def eos_id(self) -> int:
+        return self.token2id[EOS_TOKEN]
+    
+    def save(self, path: str):
+        with open(path, "w") as f:
+            json.dump({"token2id": self.token2id, "id2token": {int(k): v for k, v in self.id2token.items()}}, f)
+
+
+    @classmethod
+    def load(cls, path: str) -> "ChessTokenizer":
+        tok = cls.__new__(cls)
+        tok.token2id = {}
+        tok.id2token = {}
+        with open(path) as f:
+            data = json.load(f)
+        tok.token2id = data["token2id"]
+        tok.id2token = {int(k): v for k, v in data["id2token"].items()}
+        return tok
+    
+    
+
+
+
+
 
