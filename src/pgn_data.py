@@ -13,6 +13,9 @@ import re
 import json
 from typing import List, Tuple, Optional
 
+import torch
+from torch.utils.data import Dataset, DataLoader
+
 ### Special Tokens
 PAD_TOKEN = "<PAD>"
 BOS_TOKEN = "<BOS>"   # beginning of game
@@ -144,7 +147,44 @@ class ChessTokenizer:
         tok.id2token = {int(k): v for k, v in data["id2token"].items()}
         return tok
     
+
+## Chess Dataset class
+class Chessdataset(Dataset):
+    """
+    Autoregressive dataset: given moves 0..T-1, predict moves 1..T.
+
+    Each sample is a (input_ids, target_ids) pair of length `seq_len`.
+    Games shorter than seq_len are padded; longer games are chunked.
+    """
     
+    def __init__(self, games: List[List[int]], seq_len: int=128, pad_id: int=0):
+        self.seq_len = seq_len
+        self.pad_id = pad_id
+        self.samples = self._build_samples(games)
+
+    def _build_samples(self, games: List[List[int]]) -> List[Tuple[List[int], List[int]]]:
+        samples = []
+        for game in games:
+            # Chunk long games into overlapping windows
+            for start in range(0, max(1, len(game) - 1), self.seq_len // 2):
+                chunk = game[start: start + self.seq_len + 1]
+                if len(chunk) < 3:
+                    continue
+                # Pad if needed
+                padded = chunk + [self.pad_id] * (self.seq_len + 1 - len(chunk))
+                inp = padded[:self.seq_len]
+                tgt = padded[1: self.seq_len + 1]
+                # Replace padding in targets with -1 (ignored by cross_entropy)
+                tgt = [t if t != self.pad_id else -1 for t in tgt]
+                samples.append((inp, tgt))
+        return samples
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        inp, tgt = self.samples[idx]
+        return (torch.tensor(inp, dtype=torch.long), torch.tensor(tgt, dtype=torch.long))
 
 
 
