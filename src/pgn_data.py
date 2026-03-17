@@ -149,14 +149,14 @@ class ChessTokenizer:
     
 
 ## Chess Dataset class
-class Chessdataset(Dataset):
+class ChessDataset(Dataset):
     """
     Autoregressive dataset: given moves 0..T-1, predict moves 1..T.
 
     Each sample is a (input_ids, target_ids) pair of length `seq_len`.
     Games shorter than seq_len are padded; longer games are chunked.
     """
-    
+
     def __init__(self, games: List[List[int]], seq_len: int=128, pad_id: int=0):
         self.seq_len = seq_len
         self.pad_id = pad_id
