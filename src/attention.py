@@ -211,3 +211,61 @@ class RoPEMultiHeadAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(out)
 
+
+##################################################
+#### Variant 3: Grouped Query Attention (GQA) ####
+##################################################
+
+class GroupedQueryAttention(nn.Module):
+    """
+    GQA: fewer K/V heads than Q heads, reducing KV-cache memory at inference.
+
+    Used in: LLaMA-2 70B, Mistral 7B, Gemma, Falcon.
+
+    If kv_heads == n_heads  -> standard MHA
+    If kv_heads == 1        -> Multi-Query Attention (MQA)
+    Otherwise               -> GQA
+
+    Memory saving at inference: KV cache shrinks by factor (n_heads / kv_heads).
+    Quality: minimal degradation with kv_heads >= n_heads // 4.
+
+    Why it suits the ablation framing:
+    Same model quality, measurably less memory — a concrete benchmark story.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, kv_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+        assert n_heads % kv_heads == 0, "n_heads must be divisible by kv_heads"
+
+        self.d_model  = d_model
+        self.n_heads  = n_heads
+        self.kv_heads = kv_heads
+        self.head_dim = d_model // n_heads
+        self.groups   = n_heads // kv_heads  # how many Q heads share each K/V head
+        self.dropout  = dropout
+
+        self.q_proj   = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj   = nn.Linear(d_model, kv_heads * self.head_dim, bias=False)
+        self.v_proj   = nn.Linear(d_model, kv_heads * self.head_dim, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        B, T, C = x.shape
+
+        q = self.q_proj(x).view(B, T, self.n_heads,  self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.kv_heads, self.head_dim).transpose(1, 2)
+
+        # Expand K and V so each Q head has a corresponding K/V head
+        # (B, kv_heads, T, head_dim) -> (B, n_heads, T, head_dim)
+        k = k.repeat_interleave(self.groups, dim=1)
+        v = v.repeat_interleave(self.groups, dim=1)
+
+        out = scaled_dot_product_attention(
+            q, k, v, mask=mask, dropout=self.dropout, training=self.training
+        )
+
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.out_proj(out)
+
