@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from model import ChessTransformer
@@ -31,8 +32,6 @@ from attention import (
 def make_attention_factory(config: dict):
     """
     Returns a callable that creates one attention module per transformer layer.
-    All variant-specific parameters (kv_heads, window_size) stay here.
-    model.py never needs to know which variant is being used.
     """
     variant     = config["variant"]
     d_model     = config["d_model"]
@@ -102,10 +101,16 @@ def evaluate_move_legality(
     n_games: int = 50,
 ) -> float:
     """
-    Generates n_games sequences and checks what fraction of moves are
-    valid move tokens (not special tokens like PAD, UNK).
-    Proxy for move legality — fast alternative to full chess rule checking.
+    Generates n_games sequences and measures the fraction of moves that are
+    legal according to chess rules (via python-chess).
+
+    Each game is played out on a fresh board. The game stops at the first
+    illegal or unparseable move — only moves up to that point count as legal.
+    This is the standard legality metric used in chess language model papers.
     """
+
+    import chess
+
     model.eval()
     legal_count = 0
     total_count = 0
@@ -113,16 +118,23 @@ def evaluate_move_legality(
     seed = torch.tensor([[tokenizer.bos_id]], device=device)
 
     for _ in range(n_games):
-        generated = model.generate(seed, max_new_tokens=20, temperature=1.0, top_k=40)
-        tokens    = generated[0].tolist()
-        moves     = tokenizer.decode(tokens[1:])  # skip BOS
+        board     = chess.Board()
+        generated = model.generate(seed, max_new_tokens=40, temperature=1.0, top_k=40)
+        moves     = tokenizer.decode(generated[0].tolist()[1:])  # skip BOS
 
-        for move in moves:
-            if move in ("<EOS>", "<PAD>"):
+        for move_str in moves:
+            if move_str in ("<EOS>", "<PAD>"):
                 break
+            if move_str in ("<BOS>", "<UNK>"):
+                total_count += 1
+                break  # unparseable token — stop game
             total_count += 1
-            if move not in ("<UNK>", "<PAD>", "<BOS>", "<EOS>"):
+            try:
+                move = board.parse_san(move_str)
+                board.push(move)
                 legal_count += 1
+            except Exception:
+                break  # illegal or ambiguous move — stop game
 
     model.train()
     return legal_count / max(total_count, 1)
@@ -160,6 +172,7 @@ def train(config: dict):
         vocab_size=tokenizer.vocab_size,
         attention_factory=make_attention_factory(config),
         d_model=config["d_model"],
+        n_heads=config["n_heads"],
         n_layers=config["n_layers"],
         max_seq_len=config["seq_len"],
         dropout=config["dropout"],

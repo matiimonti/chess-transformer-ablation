@@ -19,6 +19,7 @@ V (Value) — the actual content. "What information do I actually pass along if 
 """
 
 import math
+import functools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -298,6 +299,7 @@ class SlidingWindowAttention(nn.Module):
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj  = nn.Linear(d_model, d_model, bias=False)
 
+    @functools.lru_cache(maxsize=8)
     def _sparse_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
         Combines causal mask with local window mask.
@@ -307,6 +309,9 @@ class SlidingWindowAttention(nn.Module):
         out_of_window: j < i - window_size  (too far in the past)
         causal:        j > i                (future — always blocked)
         Result: a causal band of width window_size.
+
+        Cached by (seq_len, device) — recomputed only when sequence length or
+        device changes, not on every forward pass.
         """
         causal = causal_mask(seq_len, device)
         positions = torch.arange(seq_len, device=device)
@@ -325,8 +330,10 @@ class SlidingWindowAttention(nn.Module):
 
         q, k, v = reshape(q), reshape(k), reshape(v)
 
-        # Always use the sliding window mask — ignore any passed-in mask
+        # Combine the sliding window mask with any externally supplied mask
         sparse_mask = self._sparse_mask(T, x.device)
+        if mask is not None:
+            sparse_mask = sparse_mask | mask
 
         out = scaled_dot_product_attention(
             q, k, v, mask=sparse_mask, dropout=self.dropout, training=self.training

@@ -1,21 +1,19 @@
 """
-Chess PNG dataset loading and tokenization
+Chess PGN dataset loading and tokenization
 
-Pipeline: 
-    1. Parse PNG files into lists of moves (e.g. ["e4", "e5", "Nf3", ...])
-    2. Build a vocabolary of all unique moves
+Pipeline:
+    1. Parse PGN files into lists of moves (e.g. ["e4", "e5", "Nf3", ...])
+    2. Build a vocabulary of all unique moves
     3. Encode game as integer sequences
     4. Serve (input, target) pairs for autoregressive training (future steps)
 """
 
-import os
 import re
 import json
-from pathlib import Path
 from typing import List, Tuple, Optional
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 ### Special Tokens
 PAD_TOKEN = "<PAD>"
