@@ -270,9 +270,9 @@ class GroupedQueryAttention(nn.Module):
         return self.out_proj(out)
 
 
-#########################################################
-#### Variant 4: Sparse / Sliding-Window Attention    ####
-#########################################################
+######################################################
+#### Variant 4: Sparse / Sliding-Window Attention ####
+######################################################
 
 class SlidingWindowAttention(nn.Module):
     """
