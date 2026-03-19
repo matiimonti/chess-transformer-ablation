@@ -144,6 +144,12 @@ def evaluate_move_legality(
 
 def train(config: dict):
 
+    ### Reproducibility
+    seed = config.get("seed", 42)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     ### Device
     device = torch.device(
         "cuda" if torch.cuda.is_available()
@@ -316,9 +322,10 @@ def train(config: dict):
 
             if wandb_run:
                 wandb_run.log({
-                    "val/loss":          val_loss,
-                    "val/perplexity":    val_ppl,
-                    "val/move_legality": legality,
+                    "val/loss":             val_loss,
+                    "val/perplexity":       val_ppl,
+                    "val/move_legality":    legality,
+                    "train/cumulative_flops": flops_per_step * step,
                 }, step=step)
 
             if val_loss < best_val_loss:
@@ -371,6 +378,10 @@ def parse_args():
     parser.add_argument("--dropout",     type=float, default=0.1)
     parser.add_argument("--kv_heads",    type=int,   default=2)
     parser.add_argument("--window_size", type=int,   default=32)
+
+    # Reproducibility
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
 
     # Training
     parser.add_argument("--batch_size",   type=int,   default=64)

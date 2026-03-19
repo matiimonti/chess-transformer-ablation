@@ -91,7 +91,7 @@ def measure_throughput(
     # Warmup
     with torch.no_grad():
         for _ in range(5):
-            model(batch)
+            model(batch)   # (logits, None, None) — result discarded intentionally
 
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -99,7 +99,7 @@ def measure_throughput(
     t0 = time.time()
     with torch.no_grad():
         for _ in range(n_iters):
-            model(batch)
+            model(batch)   # (logits, None, None) — result discarded intentionally
 
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -235,13 +235,13 @@ def benchmark_compile(variant: str, vocab_size: int, config: dict, device: torch
         # Warmup — compile happens on the first call
         with torch.no_grad():
             for _ in range(5):
-                model(batch)
+                model(batch)   # (logits, None, None) — result discarded intentionally
         if device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.time()
         with torch.no_grad():
             for _ in range(n_iters):
-                model(batch)
+                model(batch)   # (logits, None, None) — result discarded intentionally
         if device.type == "cuda":
             torch.cuda.synchronize()
         return 4 * seq_len * n_iters / (time.time() - t0)

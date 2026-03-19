@@ -1,30 +1,24 @@
 """
-visualize.py — Attention head visualisation for ChessTransformer.
+visualize.py — Attention head visualization utilities.
 
-Usage
------
-from visualize import plot_attention_heads
+Reads the attention weights cached on each attention module during the most
+recent forward pass (model.blocks[i].attention.attn_weights) and renders them
+as heatmaps — one subplot per head.
 
-# Show all heads of layer 0 for a single game
-fig = plot_attention_heads(model, token_ids, token_labels, layer=0)
-fig.savefig("attn_layer0.png", dpi=150, bbox_inches="tight")
+Usage:
+    from visualize import plot_attention_heads, plot_all_layers
 
-# Show one head per layer (averaged across heads) for all layers
-fig = plot_attention_heads(model, token_ids, token_labels, layer=None)
+    # Run a forward pass (weights are cached automatically)
+    with torch.no_grad():
+        model(idx)
 
-Parameters
-----------
-model        : ChessTransformer in eval mode
-token_ids    : (1, T) int64 tensor — a single tokenised game
-token_labels : list[str] of length T — move strings for axis labels
-layer        : int  → show all heads for that layer (one subplot per head)
-               None → show each layer in its own row, one head per column
-               (columns are capped at MAX_HEADS_SHOWN to keep the plot readable)
-out_path     : optional file path to save the figure (PNG/PDF/SVG)
+    fig = plot_attention_heads(model, tokenizer, idx, layer=0)
+    fig.savefig("attn_layer0.png")
 """
 
-import math
-from typing import List, Optional, Union
+from __future__ import annotations
+
+from typing import List, Optional
 
 import torch
 import matplotlib
@@ -32,114 +26,165 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-MAX_HEADS_SHOWN = 8   # cap columns so the grid stays readable
-MAX_LABELS      = 32  # truncate x/y tick labels beyond this many tokens
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-def _collect_weights(model: "ChessTransformer", token_ids: torch.Tensor):
+def _get_tokens(tokenizer, idx: torch.Tensor) -> List[str]:
     """
-    Run one forward pass and return a list of (B, heads, T, T) tensors,
-    one per transformer layer.
+    Decode a 1-D token id tensor into a list of string labels.
+    Falls back to numeric ids if the tokenizer has no id_to_token mapping.
     """
-    model.eval()
-    with torch.no_grad():
-        model(token_ids)
-    return [block.attention.attn_weights for block in model.blocks]
+    ids = idx.squeeze().tolist()
+    if isinstance(ids, int):
+        ids = [ids]
+    if hasattr(tokenizer, "id_to_token"):
+        return [tokenizer.id_to_token.get(i, str(i)) for i in ids]
+    if hasattr(tokenizer, "decode"):
+        return [tokenizer.decode([i])[0] if tokenizer.decode([i]) else str(i) for i in ids]
+    return [str(i) for i in ids]
 
 
-def _make_tick_labels(token_labels: List[str]) -> List[str]:
-    """Truncate to MAX_LABELS and shorten long individual tokens."""
-    labels = token_labels[:MAX_LABELS]
-    return [t[:6] for t in labels]   # keep labels short enough to fit
-
-
-def _plot_layer(ax: plt.Axes, weights: torch.Tensor, title: str, tick_labels: List[str]):
+def _fetch_weights(model, layer: int) -> Optional[torch.Tensor]:
     """
-    Draw a single attention heatmap on `ax`.
-    weights: (T_q, T_k) float tensor (already sliced to one head / averaged)
+    Return the cached attn_weights tensor from layer *layer*, or None.
+    Shape: (B, n_heads, T, T)
     """
-    T = weights.shape[-1]
-    shown = min(T, MAX_LABELS)
-    data  = weights[:shown, :shown].float().cpu().numpy()
+    try:
+        weights = model.blocks[layer].attention.attn_weights
+    except (AttributeError, IndexError):
+        return None
+    return weights
 
-    im = ax.imshow(data, aspect="auto", cmap="Blues", vmin=0.0, vmax=1.0)
-    ax.set_title(title, fontsize=8, pad=3)
 
-    ticks = list(range(shown))
-    ax.set_xticks(ticks)
-    ax.set_yticks(ticks)
-    ax.set_xticklabels(tick_labels[:shown], rotation=90, fontsize=5)
-    ax.set_yticklabels(tick_labels[:shown], fontsize=5)
-
-    return im
-
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def plot_attention_heads(
     model,
-    token_ids:    torch.Tensor,
-    token_labels: List[str],
-    layer:        Optional[int] = 0,
-    out_path:     Optional[str] = None,
+    tokenizer,
+    idx: torch.Tensor,
+    layer: int = 0,
+    figsize_per_head: tuple = (3.5, 3.0),
+    cmap: str = "Blues",
+    title_prefix: str = "",
 ) -> plt.Figure:
     """
-    Visualise attention weights extracted from a ChessTransformer.
+    Plot one heatmap per attention head for a single layer.
 
-    Returns a matplotlib Figure.  Call fig.savefig(...) or plt.show() as needed.
+    Parameters
+    ----------
+    model       : ChessTransformer (in eval mode, forward pass already run).
+    tokenizer   : ChessTokenizer — used to label axes with token strings.
+    idx         : (1, T) input token ids used in the last forward pass.
+    layer       : Which transformer block to visualise (0-indexed).
+    figsize_per_head : (width, height) in inches for each subplot.
+    cmap        : Matplotlib colormap name.
+    title_prefix: Optional string prepended to the figure title.
+
+    Returns
+    -------
+    matplotlib Figure.  Call fig.savefig(...) or plt.show() to display.
     """
-    all_weights = _collect_weights(model, token_ids)  # list[(B, heads, T, T)]
-    tick_labels = _make_tick_labels(token_labels)
-
-    if layer is not None:
-        # ── single layer ────────────────────────────────────────────────────
-        if layer >= len(all_weights):
-            raise ValueError(f"layer={layer} but model only has {len(all_weights)} layers")
-        weights = all_weights[layer][0]                   # (heads, T, T)
-        n_heads = min(weights.shape[0], MAX_HEADS_SHOWN)
-
-        fig, axes = plt.subplots(1, n_heads, figsize=(3 * n_heads, 3.5), constrained_layout=True)
-        if n_heads == 1:
-            axes = [axes]
-
-        fig.suptitle(f"Attention Weights — Layer {layer}", fontsize=11, fontweight="bold")
-        for h, ax in enumerate(axes[:n_heads]):
-            _plot_layer(ax, weights[h], f"Head {h}", tick_labels)
-
-        # Shared colour bar on the right
-        fig.colorbar(
-            plt.cm.ScalarMappable(cmap="Blues", norm=plt.Normalize(0, 1)),
-            ax=axes, shrink=0.8, label="Attention weight",
+    weights = _fetch_weights(model, layer)
+    if weights is None:
+        raise RuntimeError(
+            f"No attention weights found for layer {layer}. "
+            "Make sure the model ran a forward pass and that the attention "
+            "module stores weights in self.attn_weights."
         )
 
-    else:
-        # ── all layers ──────────────────────────────────────────────────────
-        n_layers    = len(all_weights)
-        n_heads_max = min(all_weights[0].shape[1], MAX_HEADS_SHOWN)
+    # weights: (B, n_heads, T, T) — take first item in batch
+    w = weights[0].detach().cpu().float()   # (n_heads, T, T)
+    n_heads, T_q, T_k = w.shape
 
-        fig, axes = plt.subplots(
-            n_layers, n_heads_max,
-            figsize=(2.8 * n_heads_max, 2.8 * n_layers),
-            squeeze=False,
-            constrained_layout=True,
-        )
-        fig.suptitle("Attention Weights — All Layers", fontsize=11, fontweight="bold")
+    tokens = _get_tokens(tokenizer, idx[0])   # length T
 
-        for l_idx, layer_weights in enumerate(all_weights):
-            weights = layer_weights[0]                    # (heads, T, T)
-            for h in range(n_heads_max):
-                ax = axes[l_idx][h]
-                _plot_layer(
-                    ax, weights[h],
-                    f"L{l_idx} H{h}" if l_idx == 0 else f"L{l_idx} H{h}",
-                    tick_labels,
-                )
+    ncols = min(n_heads, 4)
+    nrows = (n_heads + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(figsize_per_head[0] * ncols, figsize_per_head[1] * nrows),
+        squeeze=False,
+    )
 
-        fig.colorbar(
-            plt.cm.ScalarMappable(cmap="Blues", norm=plt.Normalize(0, 1)),
-            ax=axes, shrink=0.6, label="Attention weight",
-        )
+    prefix = f"{title_prefix} | " if title_prefix else ""
+    fig.suptitle(
+        f"{prefix}Layer {layer} — Attention Weights ({n_heads} heads)",
+        fontsize=12, fontweight="bold",
+    )
 
-    if out_path:
-        fig.savefig(out_path, dpi=150, bbox_inches="tight")
-        print(f"Saved attention plot to {out_path}")
+    tick_labels = tokens[:T_k]
 
+    for h in range(n_heads):
+        row, col = divmod(h, ncols)
+        ax = axes[row][col]
+        im = ax.imshow(w[h].numpy(), aspect="auto", cmap=cmap, vmin=0.0, vmax=1.0)
+        ax.set_title(f"Head {h}", fontsize=9)
+
+        # Label axes with token strings (skip if seq is long)
+        if T_k <= 32:
+            ax.set_xticks(range(T_k))
+            ax.set_xticklabels(tick_labels, rotation=90, fontsize=6)
+            ax.set_yticks(range(T_q))
+            ax.set_yticklabels(tokens[:T_q], fontsize=6)
+        else:
+            ax.xaxis.set_major_locator(ticker.MultipleLocator(max(1, T_k // 8)))
+            ax.yaxis.set_major_locator(ticker.MultipleLocator(max(1, T_q // 8)))
+
+        ax.set_xlabel("Key position", fontsize=7)
+        ax.set_ylabel("Query position", fontsize=7)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Hide unused subplots
+    for h in range(n_heads, nrows * ncols):
+        row, col = divmod(h, ncols)
+        axes[row][col].set_visible(False)
+
+    plt.tight_layout()
     return fig
+
+
+def plot_all_layers(
+    model,
+    tokenizer,
+    idx: torch.Tensor,
+    out_dir: Optional[str] = None,
+    **kwargs,
+) -> List[plt.Figure]:
+    """
+    Call plot_attention_heads for every transformer layer.
+
+    Parameters
+    ----------
+    model, tokenizer, idx : same as plot_attention_heads.
+    out_dir   : If provided, each figure is saved as
+                ``<out_dir>/attn_layer<N>.png`` and then closed.
+    **kwargs  : Forwarded to plot_attention_heads.
+
+    Returns
+    -------
+    List of Figures (empty list if out_dir was given and figures were closed).
+    """
+    n_layers = len(model.blocks)
+    figs = []
+
+    for layer in range(n_layers):
+        weights = _fetch_weights(model, layer)
+        if weights is None:
+            continue   # layer has no cached weights — skip silently
+
+        fig = plot_attention_heads(model, tokenizer, idx, layer=layer, **kwargs)
+        if out_dir is not None:
+            import os
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, f"attn_layer{layer}.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved {path}")
+        else:
+            figs.append(fig)
+
+    return figs
