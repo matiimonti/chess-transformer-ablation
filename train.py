@@ -85,7 +85,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> floa
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        _, loss = model(x, targets=y)
+        _, loss, _ = model(x, targets=y)
         total_loss += loss.item()
         total_batches += 1
 
@@ -133,7 +133,7 @@ def evaluate_move_legality(
                 move = board.parse_san(move_str)
                 board.push(move)
                 legal_count += 1
-            except Exception:
+            except (chess.IllegalMoveError, chess.AmbiguousMoveError, ValueError):
                 break  # illegal or ambiguous move — stop game
 
     model.train()
@@ -151,6 +151,19 @@ def train(config: dict):
         else "cpu"
     )
     print(f"Using device: {device}")
+
+    ### Weights & Biases
+    wandb_run = None
+    if config.get("wandb"):
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=config.get("wandb_project", "chess-transformer"),
+                name=config["variant"],
+                config=config,
+            )
+        except ImportError:
+            print("wandb not installed — pip install wandb to enable logging.")
 
     out_dir = Path(config["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +195,17 @@ def train(config: dict):
     n_params = model.count_parameters()
     print(f"Variant: {config['variant']} | Parameters: {n_params:,}")
 
+    if config.get("compile"):
+        if not hasattr(torch, "compile"):
+            print("torch.compile() not available (requires PyTorch 2.0+) — skipping")
+        else:
+            try:
+                print("Compiling model with torch.compile()...")
+                model = torch.compile(model)
+                print("torch.compile() enabled.")
+            except RuntimeError as e:
+                print(f"torch.compile() failed ({e}) — falling back to eager mode")
+
     ### Optimizer
     decay_params   = [p for n, p in model.named_parameters() if p.dim() >= 2]
     nodecay_params = [p for n, p in model.named_parameters() if p.dim() < 2]
@@ -196,11 +220,13 @@ def train(config: dict):
     )
 
     ### Training loop
-    step          = 0
-    max_steps     = config["max_steps"]
-    warmup_steps  = config.get("warmup_steps", max_steps // 10)
-    best_val_loss = float("inf")
-    metrics_log   = []
+    step            = 0
+    max_steps       = config["max_steps"]
+    warmup_steps    = config.get("warmup_steps", max_steps // 10)
+    best_val_loss   = float("inf")
+    patience        = config.get("patience", 0)   # 0 = disabled
+    patience_counter = 0
+    metrics_log     = []
 
     print(f"\nStarting training: {max_steps} steps, warmup {warmup_steps} steps")
     print("-" * 60)
@@ -209,24 +235,33 @@ def train(config: dict):
     train_iter = iter(train_loader)
     t0 = time.time()
 
-    while step < max_steps:
-        try:
-            x, y = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            x, y = next(train_iter)
+    accum_steps = config.get("gradient_accumulation_steps", 1)
 
-        x, y = x.to(device), y.to(device)
+    while step < max_steps:
+        # Gradient accumulation: accumulate gradients over `accum_steps` micro-batches
+        # before doing an optimizer step. Effective batch size = batch_size * accum_steps.
+        optimizer.zero_grad()
+        accum_loss = 0.0
+
+        for _ in range(accum_steps):
+            try:
+                x, y = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                x, y = next(train_iter)
+
+            x, y = x.to(device), y.to(device)
+            _, loss, _ = model(x, targets=y)
+            # Divide loss before backward so gradients are averaged, not summed
+            (loss / accum_steps).backward()
+            accum_loss += loss.item()
+
+        loss_for_log = accum_loss / accum_steps
 
         # Update learning rate
         lr = get_lr(step, warmup_steps, max_steps, config["max_lr"], config["min_lr"])
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
-
-        # Forward + backward
-        optimizer.zero_grad()
-        _, loss = model(x, targets=y)
-        loss.backward()
 
         # Gradient clipping
         grad_norm = nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
@@ -239,12 +274,19 @@ def train(config: dict):
             t1 = time.time()
             dt = t1 - t0
             t0 = t1
-            tokens_per_sec = config["batch_size"] * config["seq_len"] * config["log_interval"] / dt
+            tokens_per_sec = config["batch_size"] * accum_steps * config["seq_len"] * config["log_interval"] / dt
             print(
-                f"step {step:5d} | loss {loss.item():.4f} | "
+                f"step {step:5d} | loss {loss_for_log:.4f} | "
                 f"lr {lr:.2e} | grad_norm {grad_norm:.3f} | "
                 f"{tokens_per_sec:.0f} tok/s"
             )
+            if wandb_run:
+                wandb_run.log({
+                    "train/loss":           loss_for_log,
+                    "train/lr":             lr,
+                    "train/grad_norm":      grad_norm,
+                    "train/tokens_per_sec": tokens_per_sec,
+                }, step=step)
 
         # Validation
         if step % config["eval_interval"] == 0:
@@ -267,8 +309,16 @@ def train(config: dict):
             with open(out_dir / "metrics.json", "w") as f:
                 json.dump(metrics_log, f, indent=2)
 
+            if wandb_run:
+                wandb_run.log({
+                    "val/loss":          val_loss,
+                    "val/perplexity":    val_ppl,
+                    "val/move_legality": legality,
+                }, step=step)
+
             if val_loss < best_val_loss:
-                best_val_loss = val_loss
+                best_val_loss    = val_loss
+                patience_counter = 0
                 checkpoint = {
                     "step":                 step,
                     "model_state":          model.state_dict(),
@@ -279,8 +329,20 @@ def train(config: dict):
                 }
                 torch.save(checkpoint, out_dir / "best_model.pt")
                 print(f"Saved best model (val_loss={val_loss:.4f})")
+            elif patience > 0:
+                patience_counter += 1
+                print(f"No improvement ({patience_counter}/{patience})")
+                if patience_counter >= patience:
+                    print(f"Early stopping at step {step} (patience={patience})")
+                    break
 
     print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
+
+    if wandb_run:
+        wandb_run.summary["best_val_loss"] = best_val_loss
+        wandb_run.summary["best_val_ppl"]  = math.exp(min(best_val_loss, 20))
+        wandb_run.finish()
+
     return metrics_log
 
 
@@ -312,13 +374,23 @@ def parse_args():
     parser.add_argument("--max_lr",       type=float, default=3e-4)
     parser.add_argument("--min_lr",       type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--grad_clip",    type=float, default=1.0)
+    parser.add_argument("--grad_clip",                 type=float, default=1.0)
+    parser.add_argument("--patience",                  type=int,   default=0,
+                        help="Early stopping patience (evals without improvement). 0 = disabled")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Accumulate gradients over N micro-batches before stepping (effective batch = batch_size * N)")
     parser.add_argument("--warmup_steps", type=int,   default=500)
 
     # Logging
-    parser.add_argument("--log_interval",  type=int, default=50)
-    parser.add_argument("--eval_interval", type=int, default=500)
-    parser.add_argument("--out_dir",       type=str, default="checkpoints/vanilla")
+    parser.add_argument("--log_interval",   type=int,  default=50)
+    parser.add_argument("--eval_interval",  type=int,  default=500)
+    parser.add_argument("--out_dir",        type=str,  default="checkpoints/vanilla")
+    parser.add_argument("--wandb",          action="store_true", default=False,
+                        help="Enable Weights & Biases experiment tracking")
+    parser.add_argument("--wandb_project",  type=str,  default="chess-transformer",
+                        help="W&B project name")
+    parser.add_argument("--compile",        action="store_true", default=False,
+                        help="Compile model with torch.compile() (PyTorch 2.0+, Linux/CUDA recommended)")
 
     return vars(parser.parse_args())
 

@@ -7,8 +7,6 @@ Implements:
   - Grouped Query Attention (GQA)
   - Sparse / Sliding-Window Attention
 
-No nn.MultiheadAttention used anywhere — everything is explicit.
-
 B — Batch size. How many sequences you're processing at once. e.g. 64 games simultaneously
 T — Time steps, i.e. sequence length. How many tokens in each sequence. e.g. 128 moves
 C — Channels, i.e. d_model. The embedding dimension of each token. e.g. 128
@@ -23,7 +21,11 @@ import functools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple
+
+## CONSTANTS
+ROPE_THETA = 10000.0  # RoPE base frequency (LLaMA / Mistral convention)
+DEFAULT_WINDOW_SIZE = 32  # local attention window for SlidingWindowAttention
 
 
 # Utility: scaled dot-product attention (shared by all variants)
@@ -35,11 +37,12 @@ def scaled_dot_product_attention(
     mask: Optional[torch.Tensor] = None,  # (T, T) or (B, 1, T, T)
     dropout: float = 0.0,
     training: bool = False,
+    return_weights: bool = False,
 ) -> torch.Tensor:
     """
     Core attention operation.
-    Dividing by sqrt(head_dim) keeps gradients stable — without this,
-    dot products grow large in magnitude, pushing softmax into flat regions.
+    Set return_weights=True to also return the (B, heads, T, T) attention
+    probability matrix — used by the visualisation utilities.
     """
     head_dim = q.size(-1)
 
@@ -55,10 +58,10 @@ def scaled_dot_product_attention(
     if dropout > 0.0 and training:
         attn_weights = F.dropout(attn_weights, p=dropout)
 
-    return torch.matmul(attn_weights, v)
+    out = torch.matmul(attn_weights, v)
+    return (out, attn_weights) if return_weights else out
 
 ## Causal mask
-# Verify by hand that position 0 can only attend to position 0, position 1 to positions 0-1, etc
 def causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
     """Upper-triangular mask — prevents position i from attending to j > i."""
     return torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
@@ -77,29 +80,45 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = d_model // n_heads
         self.dropout  = dropout
 
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.qkv_proj    = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj    = nn.Linear(d_model, d_model, bias=False)
+        self.attn_weights: Optional[torch.Tensor] = None  # set during forward; used for visualisation
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
 
         # Project and split into Q, K, V
         qkv = self.qkv_proj(x)                          # (B, T, 3*d_model)
-        q, k, v = qkv.split(self.d_model, dim=-1)       # each (B, T, d_model) 
+        q, k, v = qkv.split(self.d_model, dim=-1)       # each (B, T, d_model)
 
         # Reshape to (B, heads, T, head_dim)
         def reshape(t):
             return t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        q, k, v = reshape(q), reshape(k), reshape(v)  
+        q, k, v = reshape(q), reshape(k), reshape(v)
 
-        out = scaled_dot_product_attention(
-            q, k, v, mask=mask, dropout=self.dropout, training=self.training
+        # Prepend cached K/V from previous decode steps
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=2)
+            v = torch.cat([past_kv[1], v], dim=2)
+
+        present = (k, v) if use_cache else None
+
+        out, weights = scaled_dot_product_attention(
+            q, k, v, mask=mask, dropout=self.dropout, training=self.training,
+            return_weights=True,
         )
+        self.attn_weights = weights.detach()  # (B, heads, T, T)
 
         # Merge heads: (B, heads, T, head_dim) -> (B, T, d_model)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(out)
+        return self.out_proj(out), present
 
 
 ##############################
@@ -110,7 +129,7 @@ def precompute_rope_freqs(
     head_dim: int,
     max_seq_len: int,
     device: torch.device,
-    theta: float = 10000.0,
+    theta: float = ROPE_THETA,
 ):
     """
     Precomputes cos/sin tables for RoPE.
@@ -149,7 +168,12 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([-x2, x1], dim=-1)
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def apply_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    offset: int = 0,
+) -> torch.Tensor:
     """
     Apply rotary embeddings to a (B, heads, T, head_dim) tensor.
 
@@ -157,10 +181,14 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
         first half:  x1*cos - x2*sin
         second half: x2*cos + x1*sin
     which is exactly the 2D rotation matrix applied to each dimension pair.
+
+    offset: number of already-cached tokens. Used during KV-cache decoding so
+    that each new token gets the rotation corresponding to its absolute position,
+    not position 0.
     """
     T = x.size(2)
-    cos = cos[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim)
-    sin = sin[:T].unsqueeze(0).unsqueeze(0)
+    cos = cos[offset : offset + T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim)
+    sin = sin[offset : offset + T].unsqueeze(0).unsqueeze(0)
     return x * cos + rotate_half(x) * sin
 
 
@@ -182,15 +210,22 @@ class RoPEMultiHeadAttention(nn.Module):
         self.head_dim = d_model // n_heads
         self.dropout  = dropout
 
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.qkv_proj    = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj    = nn.Linear(d_model, d_model, bias=False)
+        self.attn_weights: Optional[torch.Tensor] = None
 
         # Precompute and register as buffer — moves to GPU automatically with .to(device)
         cos, sin = precompute_rope_freqs(self.head_dim, max_seq_len, device=torch.device("cpu"))
         self.register_buffer("rope_cos", cos)
         self.register_buffer("rope_sin", sin)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
 
         qkv = self.qkv_proj(x)
@@ -201,16 +236,28 @@ class RoPEMultiHeadAttention(nn.Module):
 
         q, k, v = reshape(q), reshape(k), reshape(v)
 
-        # Apply rotary embeddings to Q and K only — V is not rotated
-        q = apply_rope(q, self.rope_cos, self.rope_sin)
-        k = apply_rope(k, self.rope_cos, self.rope_sin)
+        # Rotate Q and K at their *absolute* positions.
+        # offset = number of already-cached tokens so that a new token at
+        # position T_past gets cos/sin[T_past], not cos/sin[0].
+        offset = past_kv[0].size(2) if past_kv is not None else 0
+        q = apply_rope(q, self.rope_cos, self.rope_sin, offset=offset)
+        k = apply_rope(k, self.rope_cos, self.rope_sin, offset=offset)
 
-        out = scaled_dot_product_attention(
-            q, k, v, mask=mask, dropout=self.dropout, training=self.training
+        # Prepend cached (already-rotated) K/V
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=2)
+            v = torch.cat([past_kv[1], v], dim=2)
+
+        present = (k, v) if use_cache else None
+
+        out, weights = scaled_dot_product_attention(
+            q, k, v, mask=mask, dropout=self.dropout, training=self.training,
+            return_weights=True,
         )
+        self.attn_weights = weights.detach()
 
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(out)
+        return self.out_proj(out), present
 
 
 ##################################################
@@ -246,29 +293,45 @@ class GroupedQueryAttention(nn.Module):
         self.groups   = n_heads // kv_heads  # how many Q heads share each K/V head
         self.dropout  = dropout
 
-        self.q_proj   = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj   = nn.Linear(d_model, kv_heads * self.head_dim, bias=False)
-        self.v_proj   = nn.Linear(d_model, kv_heads * self.head_dim, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.q_proj      = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj      = nn.Linear(d_model, kv_heads * self.head_dim, bias=False)
+        self.v_proj      = nn.Linear(d_model, kv_heads * self.head_dim, bias=False)
+        self.out_proj    = nn.Linear(d_model, d_model, bias=False)
+        self.attn_weights: Optional[torch.Tensor] = None
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
 
         q = self.q_proj(x).view(B, T, self.n_heads,  self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.kv_heads, self.head_dim).transpose(1, 2)
 
+        # Prepend cached K/V — stored at kv_heads dimension (the memory saving)
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=2)
+            v = torch.cat([past_kv[1], v], dim=2)
+
+        present = (k, v) if use_cache else None
+
         # Expand K and V so each Q head has a corresponding K/V head
-        # (B, kv_heads, T, head_dim) -> (B, n_heads, T, head_dim)
+        # (B, kv_heads, T_total, head_dim) -> (B, n_heads, T_total, head_dim)
         k = k.repeat_interleave(self.groups, dim=1)
         v = v.repeat_interleave(self.groups, dim=1)
 
-        out = scaled_dot_product_attention(
-            q, k, v, mask=mask, dropout=self.dropout, training=self.training
+        out, weights = scaled_dot_product_attention(
+            q, k, v, mask=mask, dropout=self.dropout, training=self.training,
+            return_weights=True,
         )
+        self.attn_weights = weights.detach()
 
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(out)
+        return self.out_proj(out), present
 
 
 ######################################################
@@ -280,13 +343,9 @@ class SlidingWindowAttention(nn.Module):
     Each token attends only to the previous `window_size` tokens (local attention).
 
     Reduces complexity from O(T^2) to O(T * window_size).
-    Used in: Longformer, BigBird, Mistral's sliding window layers.
-
-    For chess sequences (length ~60-80), this is a mild constraint but
-    illustrates the principle clearly and benchmarks well.
     """
 
-    def __init__(self, d_model: int, n_heads: int, window_size: int = 32, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, window_size: int = DEFAULT_WINDOW_SIZE, dropout: float = 0.1):
         super().__init__()
         assert d_model % n_heads == 0
 
@@ -296,8 +355,9 @@ class SlidingWindowAttention(nn.Module):
         self.window_size = window_size
         self.dropout     = dropout
 
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out_proj  = nn.Linear(d_model, d_model, bias=False)
+        self.qkv_proj    = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj    = nn.Linear(d_model, d_model, bias=False)
+        self.attn_weights: Optional[torch.Tensor] = None
 
     @functools.lru_cache(maxsize=8)
     def _sparse_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -309,9 +369,6 @@ class SlidingWindowAttention(nn.Module):
         out_of_window: j < i - window_size  (too far in the past)
         causal:        j > i                (future — always blocked)
         Result: a causal band of width window_size.
-
-        Cached by (seq_len, device) — recomputed only when sequence length or
-        device changes, not on every forward pass.
         """
         causal = causal_mask(seq_len, device)
         positions = torch.arange(seq_len, device=device)
@@ -319,7 +376,13 @@ class SlidingWindowAttention(nn.Module):
         out_of_window = distance < -self.window_size
         return causal | out_of_window
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, T, C = x.shape
 
         qkv = self.qkv_proj(x)
@@ -330,15 +393,31 @@ class SlidingWindowAttention(nn.Module):
 
         q, k, v = reshape(q), reshape(k), reshape(v)
 
-        # Combine the sliding window mask with any externally supplied mask
-        sparse_mask = self._sparse_mask(T, x.device)
-        if mask is not None:
-            sparse_mask = sparse_mask | mask
+        if past_kv is not None:
+            # Decode path: concatenate new K/V with cache, then evict entries
+            # older than the window.  Eviction means we never need an explicit
+            # out-of-window mask — everything in the cache is by definition
+            # within the window.
+            k = torch.cat([past_kv[0], k], dim=2)
+            v = torch.cat([past_kv[1], v], dim=2)
+            if k.size(2) > self.window_size:
+                k = k[:, :, -self.window_size :, :]
+                v = v[:, :, -self.window_size :, :]
+            sparse_mask = mask  # may be None — no additional mask needed
+        else:
+            # Training / prefill path: full causal + window mask
+            sparse_mask = self._sparse_mask(T, x.device)
+            if mask is not None:
+                sparse_mask = sparse_mask | mask
 
-        out = scaled_dot_product_attention(
-            q, k, v, mask=sparse_mask, dropout=self.dropout, training=self.training
+        present = (k, v) if use_cache else None
+
+        out, weights = scaled_dot_product_attention(
+            q, k, v, mask=sparse_mask, dropout=self.dropout, training=self.training,
+            return_weights=True,
         )
+        self.attn_weights = weights.detach()
 
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(out)
+        return self.out_proj(out), present
 

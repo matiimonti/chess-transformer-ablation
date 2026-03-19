@@ -211,8 +211,6 @@ def load_data(
         games = games[:max_games]
 
     # Split at the game level — before building overlapping windows.
-    # Splitting on samples after the fact allows chunks from the same game
-    # to appear in both train and val (data leakage).
     split = int(len(games) * train_split)
     train_games = games[:split]
     val_games   = games[split:]

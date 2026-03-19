@@ -16,7 +16,7 @@ from pathlib import Path
 
 import torch
 import matplotlib
-matplotlib.use("Agg")   # non-interactive backend — safe on Colab / headless servers
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -30,22 +30,20 @@ VARIANTS = ["vanilla", "rope", "gqa", "sparse"]
 
 VARIANT_LABELS = {
     "vanilla": "Vanilla MHA",
-    "rope":    "RoPE MHA",
-    "gqa":     "GQA (kv=2)",
-    "sparse":  "Sliding Window",
+    "rope": "RoPE MHA",
+    "gqa": "GQA (kv=2)",
+    "sparse": "Sliding Window",
 }
 
 COLORS = {
     "vanilla": "#4C72B0",
-    "rope":    "#DD8452",
-    "gqa":     "#55A868",
-    "sparse":  "#C44E52",
+    "rope": "#DD8452",
+    "gqa": "#55A868",
+    "sparse": "#C44E52",
 }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+### Helpers
 
 def load_metrics(checkpoint_dir: str, variant: str):
     path = Path(checkpoint_dir) / variant / "metrics.json"
@@ -110,9 +108,7 @@ def measure_throughput(
     return 4 * seq_len * n_iters / elapsed
 
 
-# ---------------------------------------------------------------------------
-# Plots
-# ---------------------------------------------------------------------------
+#### Plots
 
 def plot_loss_curves(all_metrics: dict, out_path: str):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -121,13 +117,13 @@ def plot_loss_curves(all_metrics: dict, out_path: str):
     for variant, metrics in all_metrics.items():
         if metrics is None:
             continue
-        steps    = [m["step"]     for m in metrics]
+        steps = [m["step"] for m in metrics]
         val_loss = [m["val_loss"] for m in metrics]
-        val_ppl  = [m["val_ppl"]  for m in metrics]
-        color    = COLORS[variant]
+        val_ppl = [m["val_ppl"] for m in metrics]
+        color = COLORS[variant]
 
         axes[0].plot(steps, val_loss, label=VARIANT_LABELS[variant], color=color, linewidth=2, marker="o", markersize=4)
-        axes[1].plot(steps, val_ppl,  label=VARIANT_LABELS[variant], color=color, linewidth=2, marker="o", markersize=4)
+        axes[1].plot(steps, val_ppl, label=VARIANT_LABELS[variant], color=color, linewidth=2, marker="o", markersize=4)
 
     axes[0].set_title("Validation Loss")
     axes[0].set_xlabel("Training Step")
@@ -187,9 +183,9 @@ def plot_benchmark_bars(summary: list, out_path: str):
     print(f"Benchmark bars saved to {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# Summary table
-# ---------------------------------------------------------------------------
+
+
+### Summary table
 
 def print_summary_table(summary: list):
     print("\n" + "=" * 80)
@@ -209,9 +205,66 @@ def print_summary_table(summary: list):
     print("=" * 80 + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+#### torch.compile() speedup benchmark
+
+def benchmark_compile(variant: str, vocab_size: int, config: dict, device: torch.device, n_iters: int = 100) -> dict:
+    """
+    Measures forward-pass throughput with and without torch.compile().
+    Returns {"eager_tok_per_sec": ..., "compiled_tok_per_sec": ..., "speedup": ...}.
+    Only meaningful on PyTorch 2.0+ with CUDA; on MPS/CPU the gain is smaller.
+    """
+    if not hasattr(torch, "compile"):
+        print("torch.compile() not available (requires PyTorch 2.0+) — skipping")
+        return {}
+
+    seq_len = config["seq_len"]
+    batch   = torch.randint(0, vocab_size, (4, seq_len), device=device)
+
+    def make():
+        factory = make_attention_factory({**config, "variant": variant})
+        return ChessTransformer(
+            vocab_size=vocab_size,
+            attention_factory=factory,
+            d_model=config["d_model"],
+            n_heads=config["n_heads"],
+            n_layers=config["n_layers"],
+            use_sinusoidal_pe=(variant != "rope"),
+        ).to(device).eval()
+
+    def measure(model):
+        # Warmup — compile happens on the first call
+        with torch.no_grad():
+            for _ in range(5):
+                model(batch)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+        with torch.no_grad():
+            for _ in range(n_iters):
+                model(batch)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        return 4 * seq_len * n_iters / (time.time() - t0)
+
+    eager_model = make()
+    try:
+        compiled_model = torch.compile(make())
+    except RuntimeError as e:
+        print(f"torch.compile() failed ({e}) — skipping compile benchmark")
+        return {}
+
+    eager_tps    = measure(eager_model)
+    compiled_tps = measure(compiled_model)
+    speedup      = compiled_tps / eager_tps
+
+    return {
+        "eager_tok_per_sec":    eager_tps,
+        "compiled_tok_per_sec": compiled_tps,
+        "speedup":              speedup,
+    }
+
+
+#### Main
 
 def run_benchmark(checkpoint_dir: str, config: dict):
     device = torch.device(
@@ -263,6 +316,16 @@ def run_benchmark(checkpoint_dir: str, config: dict):
         print(f"  {VARIANT_LABELS[variant]}: {params:,} params | {tps:,.0f} tok/s")
 
     print_summary_table(summary)
+
+    # torch.compile() speedup — measured once on the vanilla variant as representative
+    print("Measuring torch.compile() speedup (vanilla variant)...")
+    compile_result = benchmark_compile("vanilla", vocab_size, config, device)
+    if compile_result:
+        print(
+            f"  Eager:    {compile_result['eager_tok_per_sec']:>10,.0f} tok/s\n"
+            f"  Compiled: {compile_result['compiled_tok_per_sec']:>10,.0f} tok/s\n"
+            f"  Speedup:  {compile_result['speedup']:.2f}×"
+        )
 
     out_dir = Path("plots")
     out_dir.mkdir(exist_ok=True)
