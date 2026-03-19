@@ -195,6 +195,10 @@ def train(config: dict):
     n_params = model.count_parameters()
     print(f"Variant: {config['variant']} | Parameters: {n_params:,}")
 
+    # FLOPs per optimizer step (standard 6N approximation: 2 forward + 4 backward)
+    tokens_per_step = config["batch_size"] * config["seq_len"] * config.get("gradient_accumulation_steps", 1)
+    flops_per_step  = 6 * n_params * tokens_per_step
+
     if config.get("compile"):
         if not hasattr(torch, "compile"):
             print("torch.compile() not available (requires PyTorch 2.0+) — skipping")
@@ -299,11 +303,12 @@ def train(config: dict):
             print(f"{'='*60}\n")
 
             metrics_log.append({
-                "step":          step,
-                "val_loss":      val_loss,
-                "val_ppl":       val_ppl,
-                "move_legality": legality,
-                "lr":            lr,
+                "step":             step,
+                "val_loss":         val_loss,
+                "val_ppl":          val_ppl,
+                "move_legality":    legality,
+                "lr":               lr,
+                "cumulative_flops": flops_per_step * step,
             })
 
             with open(out_dir / "metrics.json", "w") as f:
