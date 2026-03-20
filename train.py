@@ -331,9 +331,10 @@ def train(config: dict):
             if val_loss < best_val_loss:
                 best_val_loss    = val_loss
                 patience_counter = 0
+                raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
                 checkpoint = {
                     "step":                 step,
-                    "model_state":          model.state_dict(),
+                    "model_state":          raw_model.state_dict(),
                     "optimizer_state":      optimizer.state_dict(),
                     "config":               config,
                     "val_loss":             val_loss,
