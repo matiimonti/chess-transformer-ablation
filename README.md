@@ -1,4 +1,4 @@
-# Transformer Ablation Project — Chess PGN
+# Controlled Transformer Ablation — Chess PGN
 
 > Implemented a transformer from scratch in PyTorch with RoPE, GQA, and sparse attention variants, trained on 120K chess games — benchmarked architecture tradeoffs across perplexity, memory, and move legality rate.
 
